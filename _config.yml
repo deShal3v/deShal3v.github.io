@@ -1,0 +1,30 @@
+# Blog settings
+permalink: /blog/:categories/:title
+
+
+# My variables
+name: Vulnerabilites and cyber stuff
+description: deshalev  personal blog - Infosec, vulnerabilies and CTFs
+google_verification: null
+
+
+# File management
+include: [".htaccess"]
+exclude: ["README.md", "LICENSE"]
+
+
+# Sass
+sass:
+  style: :compressed
+  sass_dir: _sass
+
+# Markdown
+markdown: kramdown
+kramdown:
+  input: GFM
+  hard_wrap: false
+  syntax_highlighter: rouge
+
+# Plugins
+plugins:
+  - jemoji

